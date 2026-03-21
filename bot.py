@@ -5,19 +5,25 @@ Usage:
     # Backtest on last 60 days of hourly data
     python bot.py
 
-    # Custom: 90 days of 4h candles
+    # Live paper trading (runs continuously, Ctrl+C to stop)
+    python bot.py --live
+
+    # Custom backtest
     python bot.py --timeframe 4h --days 90
 """
 
 import argparse
+import json
 import logging
 import logging.handlers
 import os
+import signal
 import sys
+import time
 
 import pandas as pd
 
-from config.settings import BotConfig
+from config.settings import BotConfig, StrategyConfig
 from data.fetcher import fetch_ohlcv
 from strategy.sma_crossover import SMACrossoverStrategy
 from risk.stop_loss import ATRStopLoss
@@ -64,6 +70,29 @@ class TradingBot:
             fee_rate=cfg.fee_rate,
         )
         self.stop_loss = ATRStopLoss(multiplier=cfg.strategy.atr_multiplier)
+        self._running = True
+
+    # ── State persistence ──────────────────────────────────────
+
+    def save_state(self) -> None:
+        state = {
+            "broker": self.broker.to_dict(),
+            "stop_loss": self.stop_loss.to_dict(),
+        }
+        with open(self.cfg.state_file, "w") as f:
+            json.dump(state, f, indent=2)
+        self.logger.debug("State saved to %s", self.cfg.state_file)
+
+    def load_state(self) -> bool:
+        if not os.path.exists(self.cfg.state_file):
+            return False
+        with open(self.cfg.state_file) as f:
+            state = json.load(f)
+        self.broker = PaperBroker.from_dict(state["broker"], fee_rate=self.cfg.fee_rate)
+        self.stop_loss = ATRStopLoss.from_dict(state["stop_loss"])
+        self.logger.info("Restored state from %s (cash=$%.2f, trades=%d)",
+                         self.cfg.state_file, self.broker.cash, len(self.broker.closed_trades))
+        return True
 
     def run_backtest(self, df: pd.DataFrame) -> pd.DataFrame:
         """Run strategy over historical data bar by bar."""
@@ -103,6 +132,98 @@ class TradingBot:
 
         self._print_trade_log()
         return df
+
+    # ── Live paper trading ───────────────────────────────────────
+
+    def run_live(self) -> None:
+        """Run continuously, polling for new candles each interval."""
+        self.load_state()
+
+        self.logger.info(
+            "Starting LIVE paper trading: %s %s | SMA(%d/%d) | poll=%ds",
+            self.cfg.strategy.symbol,
+            self.cfg.strategy.timeframe,
+            self.cfg.strategy.sma_short,
+            self.cfg.strategy.sma_long,
+            self.cfg.poll_interval_sec,
+        )
+        self.logger.info("Cash: $%.2f | Open position: %s",
+                         self.broker.cash,
+                         "yes" if self.broker.has_position() else "no")
+        self.logger.info("Press Ctrl+C to stop gracefully.\n")
+
+        last_bar_time = None
+
+        while self._running:
+            try:
+                # Fetch enough bars to compute indicators (sma_long + buffer)
+                bars_needed = self.cfg.strategy.sma_long + 10
+                df = fetch_ohlcv(
+                    symbol=self.cfg.strategy.symbol,
+                    timeframe=self.cfg.strategy.timeframe,
+                    since_days_ago=max(bars_needed // 24 + 2, 7),
+                    limit=bars_needed,
+                )
+
+                if df.empty:
+                    self.logger.warning("No data returned, retrying...")
+                    time.sleep(self.cfg.poll_interval_sec)
+                    continue
+
+                df = self.strategy.compute_indicators(df)
+                df = self.strategy.generate_signals(df)
+
+                latest = df.iloc[-1]
+                bar_time = df.index[-1]
+
+                # Only act on NEW bars
+                if last_bar_time is not None and bar_time <= last_bar_time:
+                    self.logger.debug("No new bar yet (latest: %s)", bar_time)
+                else:
+                    last_bar_time = bar_time
+                    price = latest["close"]
+                    self.logger.info(
+                        "[TICK] %s | price=$%.2f | sma_%d=$%.2f | sma_%d=$%.2f",
+                        bar_time,
+                        price,
+                        self.cfg.strategy.sma_short,
+                        latest.get(f"sma_{self.cfg.strategy.sma_short}", 0),
+                        self.cfg.strategy.sma_long,
+                        latest.get(f"sma_{self.cfg.strategy.sma_long}", 0),
+                    )
+                    self._process_bar(latest)
+                    self.save_state()
+
+            except KeyboardInterrupt:
+                break
+            except Exception as e:
+                self.logger.error("Error in live loop: %s", e)
+
+            # Sleep in small increments so Ctrl+C is responsive
+            for _ in range(self.cfg.poll_interval_sec):
+                if not self._running:
+                    break
+                time.sleep(1)
+
+        self._shutdown()
+
+    def stop(self) -> None:
+        """Signal the live loop to stop."""
+        self._running = False
+
+    def _shutdown(self) -> None:
+        self.save_state()
+        summary = self.broker.summary()
+        self.logger.info("")
+        self.logger.info("=" * 60)
+        self.logger.info("LIVE SESSION ENDED")
+        self.logger.info("  Cash:         $%.2f", summary["cash"])
+        self.logger.info("  Total Trades: %d", summary["total_trades"])
+        self.logger.info("  Total PnL:    $%.2f", summary["total_pnl"])
+        self.logger.info("  Win Rate:     %.0f%%", summary["win_rate"] * 100)
+        self.logger.info("  State saved:  %s", self.cfg.state_file)
+        self.logger.info("=" * 60)
+        self._print_trade_log()
 
     def _process_bar(self, row: pd.Series) -> None:
         price = row["close"]
@@ -160,32 +281,41 @@ class TradingBot:
 
 def main():
     parser = argparse.ArgumentParser(description="BTC/USDT Paper Trading Bot")
+    parser.add_argument("--live", action="store_true", help="Run in live paper trading mode (continuous)")
     parser.add_argument("--timeframe", default="1h", help="Candle timeframe (default: 1h)")
-    parser.add_argument("--days", type=int, default=60, help="Days of history (default: 60)")
+    parser.add_argument("--days", type=int, default=60, help="Days of history for backtest (default: 60)")
     parser.add_argument("--cash", type=float, default=10_000, help="Starting cash (default: 10000)")
     parser.add_argument("--sma-short", type=int, default=10, help="Short SMA period (default: 10)")
     parser.add_argument("--sma-long", type=int, default=50, help="Long SMA period (default: 50)")
+    parser.add_argument("--poll", type=int, default=60, help="Poll interval in seconds for live mode (default: 60)")
     args = parser.parse_args()
 
     cfg = BotConfig(
+        mode="live_paper" if args.live else "backtest",
         initial_cash=args.cash,
-        strategy=__import__("config.settings", fromlist=["StrategyConfig"]).StrategyConfig(
+        poll_interval_sec=args.poll,
+        strategy=StrategyConfig(
             timeframe=args.timeframe,
             sma_short=args.sma_short,
             sma_long=args.sma_long,
         ),
     )
 
-    print(f"Fetching {args.days} days of {args.timeframe} BTC/USDT data...")
-    df = fetch_ohlcv(
-        symbol=cfg.strategy.symbol,
-        timeframe=cfg.strategy.timeframe,
-        since_days_ago=args.days,
-    )
-    print(f"Got {len(df)} candles.\n")
-
     bot = TradingBot(cfg)
-    bot.run_backtest(df)
+
+    if args.live:
+        # Graceful shutdown on Ctrl+C and SIGTERM
+        signal.signal(signal.SIGTERM, lambda *_: bot.stop())
+        bot.run_live()
+    else:
+        print(f"Fetching {args.days} days of {args.timeframe} BTC/USDT data...")
+        df = fetch_ohlcv(
+            symbol=cfg.strategy.symbol,
+            timeframe=cfg.strategy.timeframe,
+            since_days_ago=args.days,
+        )
+        print(f"Got {len(df)} candles.\n")
+        bot.run_backtest(df)
 
 
 if __name__ == "__main__":

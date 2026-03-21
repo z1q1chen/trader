@@ -5,7 +5,7 @@ Tracks positions, P&L, and trade history.
 
 import logging
 import uuid
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, asdict
 
 logger = logging.getLogger(__name__)
 
@@ -20,6 +20,10 @@ class Trade:
     exit_price: float | None = None
     pnl: float | None = None
     exit_reason: str = ""
+
+    def to_dict(self) -> dict:
+        """Serialize Trade to dictionary."""
+        return asdict(self)
 
 
 class PaperBroker:
@@ -92,3 +96,29 @@ class PaperBroker:
             "total_pnl": round(total_pnl, 2),
             "win_rate": round(wins / total, 2) if total > 0 else 0.0,
         }
+
+    def to_dict(self) -> dict:
+        """Serialize broker state to dictionary."""
+        return {
+            "cash": self.cash,
+            "position_qty": self.position_qty,
+            "fee_rate": self.fee_rate,
+            "open_trade": self.open_trade.to_dict() if self.open_trade else None,
+            "closed_trades": [trade.to_dict() for trade in self.closed_trades],
+        }
+
+    @classmethod
+    def from_dict(cls, data: dict, fee_rate: float = 0.001) -> "PaperBroker":
+        """Reconstruct broker from dictionary state."""
+        broker = cls(initial_cash=data["cash"], fee_rate=fee_rate)
+        broker.position_qty = data["position_qty"]
+
+        # Restore open trade
+        if data["open_trade"] is not None:
+            open_trade_dict = data["open_trade"]
+            broker.open_trade = Trade(**open_trade_dict)
+
+        # Restore closed trades
+        broker.closed_trades = [Trade(**trade_dict) for trade_dict in data["closed_trades"]]
+
+        return broker

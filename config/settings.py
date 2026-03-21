@@ -20,4 +20,6 @@ class BotConfig:
     fee_rate: float = 0.001  # 0.1% taker fee (Binance default)
     log_level: str = "INFO"
     log_file: str = "logs/bot.log"
+    state_file: str = "state.json"
+    poll_interval_sec: int = 60
     strategy: StrategyConfig = field(default_factory=StrategyConfig)

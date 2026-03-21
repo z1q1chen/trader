@@ -33,3 +33,21 @@ class ATRStopLoss:
         self.stop_price = None
         self.peak_price = None
         self._current_atr = 0.0
+
+    def to_dict(self) -> dict:
+        """Serialize the ATRStopLoss state to a dictionary."""
+        return {
+            "multiplier": self.multiplier,
+            "stop_price": self.stop_price,
+            "peak_price": self.peak_price,
+            "_current_atr": self._current_atr,
+        }
+
+    @classmethod
+    def from_dict(cls, data: dict) -> "ATRStopLoss":
+        """Deserialize an ATRStopLoss instance from a dictionary."""
+        obj = cls(multiplier=data["multiplier"])
+        obj.stop_price = data.get("stop_price")
+        obj.peak_price = data.get("peak_price")
+        obj._current_atr = data.get("_current_atr", 0.0)
+        return obj

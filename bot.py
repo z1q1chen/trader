@@ -10,6 +10,9 @@ Usage:
 
     # Custom backtest
     python bot.py --timeframe 4h --days 90
+
+    # Check P&L status (reads state.json, fetches current price)
+    python bot.py --status
 """
 
 import argparse
@@ -24,7 +27,7 @@ import time
 import pandas as pd
 
 from config.settings import BotConfig, StrategyConfig
-from data.fetcher import fetch_ohlcv
+from data.fetcher import fetch_ohlcv, fetch_current_price
 from strategy.sma_crossover import SMACrossoverStrategy
 from risk.stop_loss import ATRStopLoss
 from execution.paper_broker import PaperBroker
@@ -279,8 +282,62 @@ class TradingBot:
             )
 
 
+def show_status(state_file: str = "state.json") -> None:
+    """Read state.json, fetch current price, and print P&L summary."""
+    if not os.path.exists(state_file):
+        print(f"No state file found ({state_file}). Run --live first.")
+        return
+
+    with open(state_file) as f:
+        state = json.load(f)
+
+    broker = PaperBroker.from_dict(state["broker"])
+    summary = broker.summary()
+
+    print("=" * 50)
+    print("  PORTFOLIO STATUS")
+    print("=" * 50)
+
+    # Show open position with unrealized P&L
+    if broker.has_position() and broker.open_trade:
+        trade = broker.open_trade
+        try:
+            ticker = fetch_current_price(trade.symbol)
+            current_price = ticker["last"]
+            unrealized = (current_price - trade.entry_price) * broker.position_qty
+            pct = (current_price - trade.entry_price) / trade.entry_price * 100
+            sign = "+" if unrealized >= 0 else ""
+            print(f"  Position:    {trade.symbol} {broker.position_qty:.6f}")
+            print(f"  Entry:       ${trade.entry_price:,.2f}")
+            print(f"  Current:     ${current_price:,.2f}")
+            print(f"  Unrealized:  {sign}${unrealized:,.2f} ({sign}{pct:.1f}%)")
+        except Exception:
+            print(f"  Position:    {trade.symbol} {broker.position_qty:.6f}")
+            print(f"  Entry:       ${trade.entry_price:,.2f}")
+            print(f"  Unrealized:  (could not fetch current price)")
+    else:
+        print("  Position:    flat (no open trade)")
+
+    print(f"  Cash:        ${summary['cash']:,.2f}")
+    print("-" * 50)
+    print(f"  Trades:      {summary['total_trades']}")
+    print(f"  Realized:    ${summary['total_pnl']:,.2f}")
+    print(f"  Win Rate:    {summary['win_rate'] * 100:.0f}%")
+    print("=" * 50)
+
+    # Show recent trades
+    if broker.closed_trades:
+        print("\n  RECENT TRADES (last 5):")
+        print(f"  {'ID':<8}  {'Entry':>10}  {'Exit':>10}  {'PnL':>10}  Reason")
+        for t in broker.closed_trades[-5:]:
+            sign = "+" if (t.pnl or 0) >= 0 else ""
+            print(f"  {t.trade_id:<8}  ${t.entry_price:>9,.2f}  ${(t.exit_price or 0):>9,.2f}  {sign}${(t.pnl or 0):>8,.2f}  {t.exit_reason}")
+        print()
+
+
 def main():
     parser = argparse.ArgumentParser(description="BTC/USDT Paper Trading Bot")
+    parser.add_argument("--status", action="store_true", help="Show current P&L and portfolio status")
     parser.add_argument("--live", action="store_true", help="Run in live paper trading mode (continuous)")
     parser.add_argument("--timeframe", default="1h", help="Candle timeframe (default: 1h)")
     parser.add_argument("--days", type=int, default=60, help="Days of history for backtest (default: 60)")
@@ -300,6 +357,10 @@ def main():
             sma_long=args.sma_long,
         ),
     )
+
+    if args.status:
+        show_status(cfg.state_file)
+        return
 
     bot = TradingBot(cfg)
 

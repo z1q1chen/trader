@@ -29,6 +29,7 @@ import pandas as pd
 from config.settings import BotConfig, StrategyConfig
 from data.fetcher import fetch_ohlcv, fetch_current_price
 from strategy.sma_crossover import SMACrossoverStrategy
+from strategy.llm_strategy import LLMStrategy
 from risk.stop_loss import ATRStopLoss
 from execution.paper_broker import PaperBroker
 
@@ -60,14 +61,24 @@ def setup_logging(cfg: BotConfig) -> logging.Logger:
 
 class TradingBot:
 
-    def __init__(self, cfg: BotConfig):
+    def __init__(self, cfg: BotConfig, strategy_name: str = "sma"):
         self.cfg = cfg
+        self.strategy_name = strategy_name
         self.logger = setup_logging(cfg)
-        self.strategy = SMACrossoverStrategy(
-            short=cfg.strategy.sma_short,
-            long=cfg.strategy.sma_long,
-            atr_period=cfg.strategy.atr_period,
-        )
+
+        if strategy_name == "llm":
+            self.strategy = LLMStrategy(
+                sma_short=cfg.strategy.sma_short,
+                sma_long=cfg.strategy.sma_long,
+                atr_period=cfg.strategy.atr_period,
+            )
+        else:
+            self.strategy = SMACrossoverStrategy(
+                short=cfg.strategy.sma_short,
+                long=cfg.strategy.sma_long,
+                atr_period=cfg.strategy.atr_period,
+            )
+
         self.broker = PaperBroker(
             initial_cash=cfg.initial_cash,
             fee_rate=cfg.fee_rate,
@@ -114,8 +125,10 @@ class TradingBot:
         df = self.strategy.compute_indicators(df)
         df = self.strategy.generate_signals(df)
 
-        for _, row in df.iterrows():
-            self._process_bar(row)
+        for i in range(len(df)):
+            row = df.iloc[i]
+            # For LLM strategy, pass the dataframe up to current bar
+            self._process_bar(row, df=df.iloc[:i+1] if self.strategy_name == "llm" else None)
 
         # Force-close any open position at end of data
         if self.broker.has_position():
@@ -143,11 +156,10 @@ class TradingBot:
         self.load_state()
 
         self.logger.info(
-            "Starting LIVE paper trading: %s %s | SMA(%d/%d) | poll=%ds",
+            "Starting LIVE paper trading: %s %s | strategy=%s | poll=%ds",
             self.cfg.strategy.symbol,
             self.cfg.strategy.timeframe,
-            self.cfg.strategy.sma_short,
-            self.cfg.strategy.sma_long,
+            self.strategy_name.upper(),
             self.cfg.poll_interval_sec,
         )
         self.logger.info("Cash: $%.2f | Open position: %s",
@@ -194,7 +206,7 @@ class TradingBot:
                         self.cfg.strategy.sma_long,
                         latest.get(f"sma_{self.cfg.strategy.sma_long}", 0),
                     )
-                    self._process_bar(latest)
+                    self._process_bar(latest, df=df)
                     self.save_state()
 
             except KeyboardInterrupt:
@@ -228,7 +240,7 @@ class TradingBot:
         self.logger.info("=" * 60)
         self._print_trade_log()
 
-    def _process_bar(self, row: pd.Series) -> None:
+    def _process_bar(self, row: pd.Series, df: pd.DataFrame | None = None) -> None:
         price = row["close"]
 
         # 1. Check stop-loss FIRST (risk management priority)
@@ -243,12 +255,15 @@ class TradingBot:
                 self.stop_loss.reset()
                 return
 
-        # 2. Sell signal (death cross)
+        # LLM strategy: ask Claude for the decision
+        if self.strategy_name == "llm" and df is not None:
+            self._process_bar_llm(df, price)
+            return
+
+        # SMA strategy: use pre-computed signals
         if self.broker.has_position() and row.get("sell_signal", False):
             self.broker.sell(self.cfg.strategy.symbol, price, reason="death_cross")
             self.stop_loss.reset()
-
-        # 3. Buy signal (golden cross)
         elif not self.broker.has_position() and row.get("buy_signal", False):
             qty = (self.broker.cash * self.cfg.position_pct) / price
             self.broker.buy(self.cfg.strategy.symbol, price, qty)
@@ -258,6 +273,46 @@ class TradingBot:
                 "[SIGNAL] Golden cross | ATR=%.2f | stop=$%.2f",
                 atr_val, self.stop_loss.stop_price,
             )
+
+    def _process_bar_llm(self, df: pd.DataFrame, price: float) -> None:
+        """Let Claude analyze the full market snapshot and decide."""
+        # Build position context for the LLM
+        position = None
+        if self.broker.has_position() and self.broker.open_trade:
+            t = self.broker.open_trade
+            position = {
+                "qty": self.broker.position_qty,
+                "entry_price": t.entry_price,
+                "stop_price": self.stop_loss.stop_price,
+            }
+
+        decision = self.strategy.analyze(df, position=position)
+
+        action = decision["action"]
+        confidence = decision["confidence"]
+        reasoning = decision["reasoning"]
+
+        self.logger.info(
+            "[LLM] action=%s | confidence=%.2f | %s",
+            action.upper(), confidence, reasoning,
+        )
+
+        if action == "buy" and not self.broker.has_position():
+            qty = (self.broker.cash * self.cfg.position_pct) / price
+            self.broker.buy(self.cfg.strategy.symbol, price, qty)
+            # Use LLM's suggested stop or fall back to ATR
+            stop_pct = decision.get("suggested_stop_pct", 0.03)
+            atr_val = df.iloc[-1].get("atr", price * stop_pct)
+            self.stop_loss.on_entry(price, atr_val)
+            self.logger.info(
+                "[LLM BUY] stop=$%.2f (%.1f%% below entry)",
+                self.stop_loss.stop_price,
+                (1 - self.stop_loss.stop_price / price) * 100,
+            )
+
+        elif action == "sell" and self.broker.has_position():
+            self.broker.sell(self.cfg.strategy.symbol, price, reason=f"llm ({reasoning[:40]})")
+            self.stop_loss.reset()
 
     def _print_trade_log(self) -> None:
         trades = self.broker.closed_trades
@@ -345,6 +400,7 @@ def main():
     parser.add_argument("--sma-short", type=int, default=10, help="Short SMA period (default: 10)")
     parser.add_argument("--sma-long", type=int, default=50, help="Long SMA period (default: 50)")
     parser.add_argument("--poll", type=int, default=60, help="Poll interval in seconds for live mode (default: 60)")
+    parser.add_argument("--strategy", default="sma", choices=["sma", "llm"], help="Strategy: sma (crossover) or llm (Claude-powered)")
     args = parser.parse_args()
 
     cfg = BotConfig(
@@ -362,7 +418,7 @@ def main():
         show_status(cfg.state_file)
         return
 
-    bot = TradingBot(cfg)
+    bot = TradingBot(cfg, strategy_name=args.strategy)
 
     if args.live:
         # Graceful shutdown on Ctrl+C and SIGTERM

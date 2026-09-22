@@ -6,3 +6,4 @@ logs/
 *.parquet
 .venv/
 state.json
+.questrade_token.json

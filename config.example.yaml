@@ -1,0 +1,56 @@
+# Copy to config.yaml and fill in the account ids. config.yaml is gitignored.
+mode: paper            # paper | live — the only switch between environments
+
+profiles:
+  paper:
+    host: 127.0.0.1
+    port: 4002         # IB Gateway paper default
+    account: DUxxxxxxx # must start with DU
+    client_id: 17      # keep it fixed: orders belong to the client id that placed them
+    db: state_paper.db
+    limits:
+      risk_per_trade_pct: 0.5
+      max_daily_loss_pct: 2.0
+      max_positions: 5
+      max_order_usd: 2000
+      max_position_pct: 30
+      max_drawdown_pct: 15
+      max_orders_per_day: 20
+  live:
+    host: 127.0.0.1
+    port: 4001         # IB Gateway live default
+    account: Uxxxxxxx  # must not start with DU; also set TRADING_LIVE_CONFIRM to this id
+    client_id: 17
+    db: state_live.db
+    limits:
+      risk_per_trade_pct: 0.5
+      max_daily_loss_pct: 1.5
+      max_positions: 3
+      max_order_usd: 400
+      max_position_pct: 30
+      max_drawdown_pct: 10
+      max_orders_per_day: 10
+
+# Strategy parameters. Values marked (default) are placeholders to calibrate in backtests.
+strategy:
+  regime_symbol: QQQ
+  min_adr_pct: 4.0              # (default)
+  momentum_top_pct: 3.0         # (default) top % by 1, 3 or 6 month return
+  min_dollar_volume: 20000000   # (default)
+  opening_range_minutes: 5      # (default)
+  tight_lookback_days: 3        # (default) how recent the inside / narrow day must be
+  narrow_range_adr_frac: 0.5    # (default) "narrow day" = range <= this x ADR%
+  ema_converge_adr_mult: 1.0    # (default) EMA9/21/50 spread <= this x ADR
+  close_in_range_min: 0.7       # (default) setup B: price in the top 30% of the day's range
+  require_stacked_emas: true    # (default) setup B: EMA9 > EMA21 > EMA50
+  max_entry_slippage_pct: 0.3   # (default) limit = trigger + this
+  target_r: 3.0
+  partial_fraction: 0.3333      # (default) share of the position sold at 3R
+
+universe_file: universe.txt     # one symbol per line
+earnings_file: earnings.csv     # symbol,date
+halt_file: HALT
+reports_dir: reports
+log_file: logs/trader.log
+alert_webhook_url: ""           # plain-text POST, e.g. https://ntfy.sh/<your-topic>
+llm_model: claude-opus-5-5      # review report and theme labels only

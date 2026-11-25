@@ -1,8 +1,17 @@
 __pycache__/
 *.pyc
-.env
-logs/
-*.csv
-*.parquet
+.pytest_cache/
 .venv/
-state.json
+venv/
+
+# local configuration, state and secrets
+config.yaml
+*.db
+*.db-journal
+HALT
+logs/
+reports/
+data/
+universe.txt
+earnings.csv
+.env
